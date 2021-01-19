@@ -1,4 +1,5 @@
 // Copyright 2019 Uber Technologies, Inc. All Rights Reserved.
+// Modifications copyright Microsoft
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -65,7 +66,7 @@ inline const DataType (&EnumValuesDataType())[10] {
 }
 
 inline const char * const *EnumNamesDataType() {
-  static const char * const names[] = {
+  static const char * const names[11] = {
     "HOROVOD_UINT8",
     "HOROVOD_INT8",
     "HOROVOD_UINT16",
@@ -83,7 +84,7 @@ inline const char * const *EnumNamesDataType() {
 
 inline const char *EnumNameDataType(DataType e) {
   if (e < DataType_HOROVOD_UINT8 || e > DataType_HOROVOD_BOOL) return "";
-  const size_t index = static_cast<int>(e);
+  const size_t index = static_cast<size_t>(e);
   return EnumNamesDataType()[index];
 }
 
@@ -91,32 +92,35 @@ enum RequestType {
   RequestType_ALLREDUCE = 0,
   RequestType_ALLGATHER = 1,
   RequestType_BROADCAST = 2,
+  RequestType_JOIN = 3,
   RequestType_MIN = RequestType_ALLREDUCE,
-  RequestType_MAX = RequestType_BROADCAST
+  RequestType_MAX = RequestType_JOIN
 };
 
-inline const RequestType (&EnumValuesRequestType())[3] {
+inline const RequestType (&EnumValuesRequestType())[4] {
   static const RequestType values[] = {
     RequestType_ALLREDUCE,
     RequestType_ALLGATHER,
-    RequestType_BROADCAST
+    RequestType_BROADCAST,
+    RequestType_JOIN
   };
   return values;
 }
 
 inline const char * const *EnumNamesRequestType() {
-  static const char * const names[] = {
+  static const char * const names[5] = {
     "ALLREDUCE",
     "ALLGATHER",
     "BROADCAST",
+    "JOIN",
     nullptr
   };
   return names;
 }
 
 inline const char *EnumNameRequestType(RequestType e) {
-  if (e < RequestType_ALLREDUCE || e > RequestType_BROADCAST) return "";
-  const size_t index = static_cast<int>(e);
+  if (e < RequestType_ALLREDUCE || e > RequestType_JOIN) return "";
+  const size_t index = static_cast<size_t>(e);
   return EnumNamesRequestType()[index];
 }
 
@@ -124,26 +128,32 @@ enum ResponseType {
   ResponseType_ALLREDUCE = 0,
   ResponseType_ALLGATHER = 1,
   ResponseType_BROADCAST = 2,
-  ResponseType_ERROR = 3,
+  ResponseType_JOIN = 3,
+  ResponseType_ADASUM = 4,
+  ResponseType_ERROR = 5,
   ResponseType_MIN = ResponseType_ALLREDUCE,
   ResponseType_MAX = ResponseType_ERROR
 };
 
-inline const ResponseType (&EnumValuesResponseType())[4] {
+inline const ResponseType (&EnumValuesResponseType())[6] {
   static const ResponseType values[] = {
     ResponseType_ALLREDUCE,
     ResponseType_ALLGATHER,
     ResponseType_BROADCAST,
+    ResponseType_JOIN,
+    ResponseType_ADASUM,
     ResponseType_ERROR
   };
   return values;
 }
 
 inline const char * const *EnumNamesResponseType() {
-  static const char * const names[] = {
+  static const char * const names[7] = {
     "ALLREDUCE",
     "ALLGATHER",
     "BROADCAST",
+    "JOIN",
+    "ADASUM",
     "ERROR",
     nullptr
   };
@@ -152,7 +162,7 @@ inline const char * const *EnumNamesResponseType() {
 
 inline const char *EnumNameResponseType(ResponseType e) {
   if (e < ResponseType_ALLREDUCE || e > ResponseType_ERROR) return "";
-  const size_t index = static_cast<int>(e);
+  const size_t index = static_cast<size_t>(e);
   return EnumNamesResponseType()[index];
 }
 
@@ -164,16 +174,18 @@ struct Request FLATBUFFERS_FINAL_CLASS : private flatbuffers::Table {
     VT_TENSOR_NAME = 10,
     VT_ROOT_RANK = 12,
     VT_DEVICE = 14,
-    VT_TENSOR_SHAPE = 16
+    VT_TENSOR_SHAPE = 16,
+    VT_PRESCALE_FACTOR = 18,
+    VT_POSTSCALE_FACTOR = 20
   };
   int32_t request_rank() const {
     return GetField<int32_t>(VT_REQUEST_RANK, 0);
   }
-  RequestType request_type() const {
-    return static_cast<RequestType>(GetField<int8_t>(VT_REQUEST_TYPE, 0));
+  horovod::common::wire::RequestType request_type() const {
+    return static_cast<horovod::common::wire::RequestType>(GetField<int8_t>(VT_REQUEST_TYPE, 0));
   }
-  DataType tensor_type() const {
-    return static_cast<DataType>(GetField<int8_t>(VT_TENSOR_TYPE, 0));
+  horovod::common::wire::DataType tensor_type() const {
+    return static_cast<horovod::common::wire::DataType>(GetField<int8_t>(VT_TENSOR_TYPE, 0));
   }
   const flatbuffers::String *tensor_name() const {
     return GetPointer<const flatbuffers::String *>(VT_TENSOR_NAME);
@@ -187,6 +199,12 @@ struct Request FLATBUFFERS_FINAL_CLASS : private flatbuffers::Table {
   const flatbuffers::Vector<int64_t> *tensor_shape() const {
     return GetPointer<const flatbuffers::Vector<int64_t> *>(VT_TENSOR_SHAPE);
   }
+  double prescale_factor() const {
+    return GetField<double>(VT_PRESCALE_FACTOR, 0.0);
+  }
+  double postscale_factor() const {
+    return GetField<double>(VT_POSTSCALE_FACTOR, 0.0);
+  }
   bool Verify(flatbuffers::Verifier &verifier) const {
     return VerifyTableStart(verifier) &&
            VerifyField<int32_t>(verifier, VT_REQUEST_RANK) &&
@@ -198,6 +216,8 @@ struct Request FLATBUFFERS_FINAL_CLASS : private flatbuffers::Table {
            VerifyField<int32_t>(verifier, VT_DEVICE) &&
            VerifyOffset(verifier, VT_TENSOR_SHAPE) &&
            verifier.VerifyVector(tensor_shape()) &&
+           VerifyField<double>(verifier, VT_PRESCALE_FACTOR) &&
+           VerifyField<double>(verifier, VT_POSTSCALE_FACTOR) &&
            verifier.EndTable();
   }
 };
@@ -208,10 +228,10 @@ struct RequestBuilder {
   void add_request_rank(int32_t request_rank) {
     fbb_.AddElement<int32_t>(Request::VT_REQUEST_RANK, request_rank, 0);
   }
-  void add_request_type(RequestType request_type) {
+  void add_request_type(horovod::common::wire::RequestType request_type) {
     fbb_.AddElement<int8_t>(Request::VT_REQUEST_TYPE, static_cast<int8_t>(request_type), 0);
   }
-  void add_tensor_type(DataType tensor_type) {
+  void add_tensor_type(horovod::common::wire::DataType tensor_type) {
     fbb_.AddElement<int8_t>(Request::VT_TENSOR_TYPE, static_cast<int8_t>(tensor_type), 0);
   }
   void add_tensor_name(flatbuffers::Offset<flatbuffers::String> tensor_name) {
@@ -225,6 +245,12 @@ struct RequestBuilder {
   }
   void add_tensor_shape(flatbuffers::Offset<flatbuffers::Vector<int64_t>> tensor_shape) {
     fbb_.AddOffset(Request::VT_TENSOR_SHAPE, tensor_shape);
+  }
+  void add_prescale_factor(double prescale_factor) {
+    fbb_.AddElement<double>(Request::VT_PRESCALE_FACTOR, prescale_factor, 0.0);
+  }
+  void add_postscale_factor(double postscale_factor) {
+    fbb_.AddElement<double>(Request::VT_POSTSCALE_FACTOR, postscale_factor, 0.0);
   }
   explicit RequestBuilder(flatbuffers::FlatBufferBuilder &_fbb)
         : fbb_(_fbb) {
@@ -241,13 +267,17 @@ struct RequestBuilder {
 inline flatbuffers::Offset<Request> CreateRequest(
     flatbuffers::FlatBufferBuilder &_fbb,
     int32_t request_rank = 0,
-    RequestType request_type = RequestType_ALLREDUCE,
-    DataType tensor_type = DataType_HOROVOD_UINT8,
+    horovod::common::wire::RequestType request_type = horovod::common::wire::RequestType_ALLREDUCE,
+    horovod::common::wire::DataType tensor_type = horovod::common::wire::DataType_HOROVOD_UINT8,
     flatbuffers::Offset<flatbuffers::String> tensor_name = 0,
     int32_t root_rank = 0,
     int32_t device = 0,
-    flatbuffers::Offset<flatbuffers::Vector<int64_t>> tensor_shape = 0) {
+    flatbuffers::Offset<flatbuffers::Vector<int64_t>> tensor_shape = 0,
+    double prescale_factor = 0.0,
+    double postscale_factor = 0.0) {
   RequestBuilder builder_(_fbb);
+  builder_.add_postscale_factor(postscale_factor);
+  builder_.add_prescale_factor(prescale_factor);
   builder_.add_tensor_shape(tensor_shape);
   builder_.add_device(device);
   builder_.add_root_rank(root_rank);
@@ -261,12 +291,14 @@ inline flatbuffers::Offset<Request> CreateRequest(
 inline flatbuffers::Offset<Request> CreateRequestDirect(
     flatbuffers::FlatBufferBuilder &_fbb,
     int32_t request_rank = 0,
-    RequestType request_type = RequestType_ALLREDUCE,
-    DataType tensor_type = DataType_HOROVOD_UINT8,
+    horovod::common::wire::RequestType request_type = horovod::common::wire::RequestType_ALLREDUCE,
+    horovod::common::wire::DataType tensor_type = horovod::common::wire::DataType_HOROVOD_UINT8,
     const char *tensor_name = nullptr,
     int32_t root_rank = 0,
     int32_t device = 0,
-    const std::vector<int64_t> *tensor_shape = nullptr) {
+    const std::vector<int64_t> *tensor_shape = nullptr,
+    double prescale_factor = 0.0,
+    double postscale_factor = 0.0) {
   auto tensor_name__ = tensor_name ? _fbb.CreateString(tensor_name) : 0;
   auto tensor_shape__ = tensor_shape ? _fbb.CreateVector<int64_t>(*tensor_shape) : 0;
   return horovod::common::wire::CreateRequest(
@@ -277,7 +309,9 @@ inline flatbuffers::Offset<Request> CreateRequestDirect(
       tensor_name__,
       root_rank,
       device,
-      tensor_shape__);
+      tensor_shape__,
+      prescale_factor,
+      postscale_factor);
 }
 
 struct RequestList FLATBUFFERS_FINAL_CLASS : private flatbuffers::Table {
@@ -285,8 +319,8 @@ struct RequestList FLATBUFFERS_FINAL_CLASS : private flatbuffers::Table {
     VT_REQUESTS = 4,
     VT_SHUTDOWN = 6
   };
-  const flatbuffers::Vector<flatbuffers::Offset<Request>> *requests() const {
-    return GetPointer<const flatbuffers::Vector<flatbuffers::Offset<Request>> *>(VT_REQUESTS);
+  const flatbuffers::Vector<flatbuffers::Offset<horovod::common::wire::Request>> *requests() const {
+    return GetPointer<const flatbuffers::Vector<flatbuffers::Offset<horovod::common::wire::Request>> *>(VT_REQUESTS);
   }
   bool shutdown() const {
     return GetField<uint8_t>(VT_SHUTDOWN, 0) != 0;
@@ -304,7 +338,7 @@ struct RequestList FLATBUFFERS_FINAL_CLASS : private flatbuffers::Table {
 struct RequestListBuilder {
   flatbuffers::FlatBufferBuilder &fbb_;
   flatbuffers::uoffset_t start_;
-  void add_requests(flatbuffers::Offset<flatbuffers::Vector<flatbuffers::Offset<Request>>> requests) {
+  void add_requests(flatbuffers::Offset<flatbuffers::Vector<flatbuffers::Offset<horovod::common::wire::Request>>> requests) {
     fbb_.AddOffset(RequestList::VT_REQUESTS, requests);
   }
   void add_shutdown(bool shutdown) {
@@ -324,7 +358,7 @@ struct RequestListBuilder {
 
 inline flatbuffers::Offset<RequestList> CreateRequestList(
     flatbuffers::FlatBufferBuilder &_fbb,
-    flatbuffers::Offset<flatbuffers::Vector<flatbuffers::Offset<Request>>> requests = 0,
+    flatbuffers::Offset<flatbuffers::Vector<flatbuffers::Offset<horovod::common::wire::Request>>> requests = 0,
     bool shutdown = false) {
   RequestListBuilder builder_(_fbb);
   builder_.add_requests(requests);
@@ -334,9 +368,9 @@ inline flatbuffers::Offset<RequestList> CreateRequestList(
 
 inline flatbuffers::Offset<RequestList> CreateRequestListDirect(
     flatbuffers::FlatBufferBuilder &_fbb,
-    const std::vector<flatbuffers::Offset<Request>> *requests = nullptr,
+    const std::vector<flatbuffers::Offset<horovod::common::wire::Request>> *requests = nullptr,
     bool shutdown = false) {
-  auto requests__ = requests ? _fbb.CreateVector<flatbuffers::Offset<Request>>(*requests) : 0;
+  auto requests__ = requests ? _fbb.CreateVector<flatbuffers::Offset<horovod::common::wire::Request>>(*requests) : 0;
   return horovod::common::wire::CreateRequestList(
       _fbb,
       requests__,
@@ -349,10 +383,13 @@ struct Response FLATBUFFERS_FINAL_CLASS : private flatbuffers::Table {
     VT_TENSOR_NAMES = 6,
     VT_ERROR_MESSAGE = 8,
     VT_DEVICES = 10,
-    VT_TENSOR_SIZES = 12
+    VT_TENSOR_SIZES = 12,
+    VT_TENSOR_TYPE = 14,
+    VT_PRESCALE_FACTOR = 16,
+    VT_POSTSCALE_FACTOR = 18
   };
-  ResponseType response_type() const {
-    return static_cast<ResponseType>(GetField<int8_t>(VT_RESPONSE_TYPE, 0));
+  horovod::common::wire::ResponseType response_type() const {
+    return static_cast<horovod::common::wire::ResponseType>(GetField<int8_t>(VT_RESPONSE_TYPE, 0));
   }
   const flatbuffers::Vector<flatbuffers::Offset<flatbuffers::String>> *tensor_names() const {
     return GetPointer<const flatbuffers::Vector<flatbuffers::Offset<flatbuffers::String>> *>(VT_TENSOR_NAMES);
@@ -366,6 +403,15 @@ struct Response FLATBUFFERS_FINAL_CLASS : private flatbuffers::Table {
   const flatbuffers::Vector<int64_t> *tensor_sizes() const {
     return GetPointer<const flatbuffers::Vector<int64_t> *>(VT_TENSOR_SIZES);
   }
+  horovod::common::wire::DataType tensor_type() const {
+    return static_cast<horovod::common::wire::DataType>(GetField<int8_t>(VT_TENSOR_TYPE, 0));
+  }
+  double prescale_factor() const {
+    return GetField<double>(VT_PRESCALE_FACTOR, 0.0);
+  }
+  double postscale_factor() const {
+    return GetField<double>(VT_POSTSCALE_FACTOR, 0.0);
+  }
   bool Verify(flatbuffers::Verifier &verifier) const {
     return VerifyTableStart(verifier) &&
            VerifyField<int8_t>(verifier, VT_RESPONSE_TYPE) &&
@@ -378,6 +424,9 @@ struct Response FLATBUFFERS_FINAL_CLASS : private flatbuffers::Table {
            verifier.VerifyVector(devices()) &&
            VerifyOffset(verifier, VT_TENSOR_SIZES) &&
            verifier.VerifyVector(tensor_sizes()) &&
+           VerifyField<int8_t>(verifier, VT_TENSOR_TYPE) &&
+           VerifyField<double>(verifier, VT_PRESCALE_FACTOR) &&
+           VerifyField<double>(verifier, VT_POSTSCALE_FACTOR) &&
            verifier.EndTable();
   }
 };
@@ -385,7 +434,7 @@ struct Response FLATBUFFERS_FINAL_CLASS : private flatbuffers::Table {
 struct ResponseBuilder {
   flatbuffers::FlatBufferBuilder &fbb_;
   flatbuffers::uoffset_t start_;
-  void add_response_type(ResponseType response_type) {
+  void add_response_type(horovod::common::wire::ResponseType response_type) {
     fbb_.AddElement<int8_t>(Response::VT_RESPONSE_TYPE, static_cast<int8_t>(response_type), 0);
   }
   void add_tensor_names(flatbuffers::Offset<flatbuffers::Vector<flatbuffers::Offset<flatbuffers::String>>> tensor_names) {
@@ -399,6 +448,15 @@ struct ResponseBuilder {
   }
   void add_tensor_sizes(flatbuffers::Offset<flatbuffers::Vector<int64_t>> tensor_sizes) {
     fbb_.AddOffset(Response::VT_TENSOR_SIZES, tensor_sizes);
+  }
+  void add_tensor_type(horovod::common::wire::DataType tensor_type) {
+    fbb_.AddElement<int8_t>(Response::VT_TENSOR_TYPE, static_cast<int8_t>(tensor_type), 0);
+  }
+  void add_prescale_factor(double prescale_factor) {
+    fbb_.AddElement<double>(Response::VT_PRESCALE_FACTOR, prescale_factor, 0.0);
+  }
+  void add_postscale_factor(double postscale_factor) {
+    fbb_.AddElement<double>(Response::VT_POSTSCALE_FACTOR, postscale_factor, 0.0);
   }
   explicit ResponseBuilder(flatbuffers::FlatBufferBuilder &_fbb)
         : fbb_(_fbb) {
@@ -414,27 +472,36 @@ struct ResponseBuilder {
 
 inline flatbuffers::Offset<Response> CreateResponse(
     flatbuffers::FlatBufferBuilder &_fbb,
-    ResponseType response_type = ResponseType_ALLREDUCE,
+    horovod::common::wire::ResponseType response_type = horovod::common::wire::ResponseType_ALLREDUCE,
     flatbuffers::Offset<flatbuffers::Vector<flatbuffers::Offset<flatbuffers::String>>> tensor_names = 0,
     flatbuffers::Offset<flatbuffers::String> error_message = 0,
     flatbuffers::Offset<flatbuffers::Vector<int32_t>> devices = 0,
-    flatbuffers::Offset<flatbuffers::Vector<int64_t>> tensor_sizes = 0) {
+    flatbuffers::Offset<flatbuffers::Vector<int64_t>> tensor_sizes = 0,
+    horovod::common::wire::DataType tensor_type = horovod::common::wire::DataType_HOROVOD_UINT8,
+    double prescale_factor = 0.0,
+    double postscale_factor = 0.0) {
   ResponseBuilder builder_(_fbb);
+  builder_.add_postscale_factor(postscale_factor);
+  builder_.add_prescale_factor(prescale_factor);
   builder_.add_tensor_sizes(tensor_sizes);
   builder_.add_devices(devices);
   builder_.add_error_message(error_message);
   builder_.add_tensor_names(tensor_names);
+  builder_.add_tensor_type(tensor_type);
   builder_.add_response_type(response_type);
   return builder_.Finish();
 }
 
 inline flatbuffers::Offset<Response> CreateResponseDirect(
     flatbuffers::FlatBufferBuilder &_fbb,
-    ResponseType response_type = ResponseType_ALLREDUCE,
+    horovod::common::wire::ResponseType response_type = horovod::common::wire::ResponseType_ALLREDUCE,
     const std::vector<flatbuffers::Offset<flatbuffers::String>> *tensor_names = nullptr,
     const char *error_message = nullptr,
     const std::vector<int32_t> *devices = nullptr,
-    const std::vector<int64_t> *tensor_sizes = nullptr) {
+    const std::vector<int64_t> *tensor_sizes = nullptr,
+    horovod::common::wire::DataType tensor_type = horovod::common::wire::DataType_HOROVOD_UINT8,
+    double prescale_factor = 0.0,
+    double postscale_factor = 0.0) {
   auto tensor_names__ = tensor_names ? _fbb.CreateVector<flatbuffers::Offset<flatbuffers::String>>(*tensor_names) : 0;
   auto error_message__ = error_message ? _fbb.CreateString(error_message) : 0;
   auto devices__ = devices ? _fbb.CreateVector<int32_t>(*devices) : 0;
@@ -445,7 +512,10 @@ inline flatbuffers::Offset<Response> CreateResponseDirect(
       tensor_names__,
       error_message__,
       devices__,
-      tensor_sizes__);
+      tensor_sizes__,
+      tensor_type,
+      prescale_factor,
+      postscale_factor);
 }
 
 struct ResponseList FLATBUFFERS_FINAL_CLASS : private flatbuffers::Table {
@@ -453,8 +523,8 @@ struct ResponseList FLATBUFFERS_FINAL_CLASS : private flatbuffers::Table {
     VT_RESPONSES = 4,
     VT_SHUTDOWN = 6
   };
-  const flatbuffers::Vector<flatbuffers::Offset<Response>> *responses() const {
-    return GetPointer<const flatbuffers::Vector<flatbuffers::Offset<Response>> *>(VT_RESPONSES);
+  const flatbuffers::Vector<flatbuffers::Offset<horovod::common::wire::Response>> *responses() const {
+    return GetPointer<const flatbuffers::Vector<flatbuffers::Offset<horovod::common::wire::Response>> *>(VT_RESPONSES);
   }
   bool shutdown() const {
     return GetField<uint8_t>(VT_SHUTDOWN, 0) != 0;
@@ -472,7 +542,7 @@ struct ResponseList FLATBUFFERS_FINAL_CLASS : private flatbuffers::Table {
 struct ResponseListBuilder {
   flatbuffers::FlatBufferBuilder &fbb_;
   flatbuffers::uoffset_t start_;
-  void add_responses(flatbuffers::Offset<flatbuffers::Vector<flatbuffers::Offset<Response>>> responses) {
+  void add_responses(flatbuffers::Offset<flatbuffers::Vector<flatbuffers::Offset<horovod::common::wire::Response>>> responses) {
     fbb_.AddOffset(ResponseList::VT_RESPONSES, responses);
   }
   void add_shutdown(bool shutdown) {
@@ -492,7 +562,7 @@ struct ResponseListBuilder {
 
 inline flatbuffers::Offset<ResponseList> CreateResponseList(
     flatbuffers::FlatBufferBuilder &_fbb,
-    flatbuffers::Offset<flatbuffers::Vector<flatbuffers::Offset<Response>>> responses = 0,
+    flatbuffers::Offset<flatbuffers::Vector<flatbuffers::Offset<horovod::common::wire::Response>>> responses = 0,
     bool shutdown = false) {
   ResponseListBuilder builder_(_fbb);
   builder_.add_responses(responses);
@@ -502,9 +572,9 @@ inline flatbuffers::Offset<ResponseList> CreateResponseList(
 
 inline flatbuffers::Offset<ResponseList> CreateResponseListDirect(
     flatbuffers::FlatBufferBuilder &_fbb,
-    const std::vector<flatbuffers::Offset<Response>> *responses = nullptr,
+    const std::vector<flatbuffers::Offset<horovod::common::wire::Response>> *responses = nullptr,
     bool shutdown = false) {
-  auto responses__ = responses ? _fbb.CreateVector<flatbuffers::Offset<Response>>(*responses) : 0;
+  auto responses__ = responses ? _fbb.CreateVector<flatbuffers::Offset<horovod::common::wire::Response>>(*responses) : 0;
   return horovod::common::wire::CreateResponseList(
       _fbb,
       responses__,

@@ -1,4 +1,5 @@
 // Copyright 2019 Uber Technologies, Inc. All Rights Reserved.
+// Modifications copyright Microsoft
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -18,49 +19,35 @@
 
 #include <functional>
 
-#include "common.h"
+#if HAVE_MPI
 #define OMPI_SKIP_MPICXX
 #include "mpi.h"
+#endif
+
+#include "common.h"
 
 namespace horovod {
 namespace common {
 
-// The number of elements held by fusion buffer and hierarchical
-// allreduce size is always a multiple of FUSION_BUFFER_ATOMIC_UNIT
-#define FUSION_BUFFER_ATOMIC_UNIT 64
-
-// Horovod knobs.
-#define HOROVOD_MPI_THREADS_DISABLE "HOROVOD_MPI_THREADS_DISABLE"
-#define HOROVOD_TIMELINE "HOROVOD_TIMELINE"
-#define HOROVOD_TIMELINE_MARK_CYCLES "HOROVOD_TIMELINE_MARK_CYCLES"
-#define HOROVOD_AUTOTUNE "HOROVOD_AUTOTUNE"
-#define HOROVOD_AUTOTUNE_LOG "HOROVOD_AUTOTUNE_LOG"
-#define HOROVOD_FUSION_THRESHOLD "HOROVOD_FUSION_THRESHOLD"
-#define HOROVOD_CYCLE_TIME "HOROVOD_CYCLE_TIME"
-#define HOROVOD_STALL_CHECK_DISABLE "HOROVOD_STALL_CHECK_DISABLE"
-#define HOROVOD_STALL_CHECK_TIME_SECONDS "HOROVOD_STALL_CHECK_TIME_SECONDS"
-#define HOROVOD_STALL_SHUTDOWN_TIME_SECONDS "HOROVOD_STALL_SHUTDOWN_TIME_SECONDS"
-#define HOROVOD_HIERARCHICAL_ALLREDUCE "HOROVOD_HIERARCHICAL_ALLREDUCE"
-#define HOROVOD_HIERARCHICAL_ALLGATHER "HOROVOD_HIERARCHICAL_ALLGATHER"
-#define HOROVOD_CACHE_CAPACITY "HOROVOD_CACHE_CAPACITY"
-#define HOROVOD_MLSL_BGT_AFFINITY "HOROVOD_MLSL_BGT_AFFINITY"
-#define HOROVOD_NUM_NCCL_STREAMS "HOROVOD_NUM_NCCL_STREAMS"
-#define HOROVOD_CPU_OPERATIONS "HOROVOD_CPU_OPERATIONS"
-#define HOROVOD_GLOO_IFACE "HOROVOD_GLOO_IFACE"
-#define HOROVOD_MPI "MPI"
-#define HOROVOD_MLSL "MLSL"
-#define HOROVOD_GLOO "GLOO"
-
 // Check that Horovod is initialized.
 Status CheckInitialized();
+
+enum ReduceOp {
+    AVERAGE = 0, // This value should never appear past framework code, as
+                 // averaging is taken care of there.
+    SUM = 1,
+    ADASUM = 2
+};
 
 extern "C" {
 
 // C interface to initialize Horovod.
 void horovod_init(const int *ranks, int nranks);
 
+#if HAVE_MPI
 // C interface to initialize Horovod with the given MPI communicator.
 void horovod_init_comm(MPI_Comm comm);
+#endif
 
 // C interface to shut down Horovod.
 void horovod_shutdown();
@@ -84,14 +71,66 @@ int horovod_local_size();
 // C interface to return flag indicating whether MPI multi-threading is
 // supported. Returns -1 if Horovod is not initialized.
 int horovod_mpi_threads_supported();
+
+// C interface to return flag indicating whether MPI is enabled.
+bool horovod_mpi_enabled();
+
+// C interface to return flag indicating whether Horovod was compiled with MPI support.
+bool horovod_mpi_built();
+
+// C interface to return flag indicating whether Gloo is enabled.
+bool horovod_gloo_enabled();
+
+// C interface to return flag indicating whether Horovod was compiled with Gloo support.
+bool horovod_gloo_built();
+
+// C interface to return integer indicating whether Horovod was compiled with NCCL support.
+// Returns NCCL_VERSION_CODE if NCCL is available, else returns 0.
+int horovod_nccl_built();
+
+// C interface to return flag indicating whether Horovod was compiled with DDL support.
+bool horovod_ddl_built();
+
+// C interface to return flag indicating whether Horovod was compiled with CCL support.
+bool horovod_ccl_built();
+
+// C interface to return flag indicating whether Horovod was compiled with CUDA support.
+bool horovod_cuda_built();
+
+// C interface to return flag indicating whether Horovod was compiled with ROCm support.
+bool horovod_rocm_built();
+
+// C interface to return value of the ReduceOp::AVERAGE enum field.
+int horovod_reduce_op_average();
+
+// C interface to return value of the ReduceOp::SUM enum field.
+int horovod_reduce_op_sum();
+
+// C interface to return value of the ReduceOp::ADASUM enum field.
+int horovod_reduce_op_adasum();
+
 }
 
 Status EnqueueTensorAllreduce(std::shared_ptr<OpContext> context,
                               std::shared_ptr<Tensor> tensor,
                               std::shared_ptr<Tensor> output,
                               std::shared_ptr<ReadyEvent> ready_event,
-                              const std::string name, const int device,
-                              StatusCallback callback);
+                              std::string name, const int device,
+                              StatusCallback callback,
+                              ReduceOp reduce_op = ReduceOp::SUM,
+                              double prescale_factor = 1.0,
+                              double postscale_factor = 1.0);
+
+Status EnqueueTensorAllreduces(std::vector<std::shared_ptr<OpContext>>& contexts,
+                               std::vector<std::shared_ptr<Tensor>>& tensors,
+                               std::vector<std::shared_ptr<Tensor>>& outputs,
+                               std::vector<std::shared_ptr<ReadyEvent>>& ready_events,
+                               std::vector<std::string>& names,
+                               const int device,
+                               std::vector<StatusCallback>& callbacks,
+                               ReduceOp reduce_op = ReduceOp::SUM,
+                               double prescale_factor = 1.0,
+                               double postscale_factor = 1.0);
 
 Status EnqueueTensorAllgather(std::shared_ptr<OpContext> context,
                               std::shared_ptr<Tensor> tensor,
@@ -102,6 +141,18 @@ Status EnqueueTensorAllgather(std::shared_ptr<OpContext> context,
 Status EnqueueTensorBroadcast(std::shared_ptr<OpContext> context,
                               std::shared_ptr<Tensor> tensor,
                               std::shared_ptr<Tensor> output, int root_rank,
+                              std::shared_ptr<ReadyEvent> ready_event,
+                              const std::string name, const int device,
+                              StatusCallback callback);
+
+Status EnqueueTensorAlltoall(std::shared_ptr<OpContext> context,
+                             std::shared_ptr<Tensor> tensor,
+                             std::shared_ptr<Tensor> splits,
+                             std::shared_ptr<ReadyEvent> ready_event,
+                             const std::string name, const int device,
+                             StatusCallback callback);
+
+Status EnqueueJoin(std::shared_ptr<OpContext> context,
                               std::shared_ptr<ReadyEvent> ready_event,
                               const std::string name, const int device,
                               StatusCallback callback);

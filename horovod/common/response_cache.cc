@@ -13,11 +13,14 @@
 // limitations under the License.
 // =============================================================================
 
-#include<climits>
-#include<cstring>
-
-#include "logging.h"
 #include "response_cache.h"
+
+#include <climits>
+#include <cstring>
+
+#include "controller.h"
+#include "logging.h"
+#include "tensor_queue.h"
 
 namespace horovod {
 namespace common {
@@ -50,10 +53,13 @@ ResponseCache::CacheState ResponseCache::cached(const Request& message) const {
     // If entry associated with this request already exists in cache, check
     // if tensor parameters match. If not, return that entry is invalid.
     uint32_t cache_bit = it->second;
+    auto& cache_response = std::get<0>(*cache_iters_[cache_bit]);
     auto& cache_params = std::get<1>(*cache_iters_[cache_bit]);
     return (cache_params.device == message.device() &&
             cache_params.dtype == message.tensor_type() &&
-            cache_params.shape == message.tensor_shape())
+            cache_params.shape == message.tensor_shape() &&
+            cache_response.prescale_factor() == message.prescale_factor() &&
+            cache_response.postscale_factor() == message.postscale_factor())
                ? CacheState::HIT
                : CacheState::INVALID;
   } else {
@@ -63,17 +69,32 @@ ResponseCache::CacheState ResponseCache::cached(const Request& message) const {
 
 ResponseCache::CacheState
 ResponseCache::cached(const Response& response,
-                      const TensorParams& params) const {
+                      const TensorParams& params, bool joined) const {
   assert(response.tensor_names().size() == 1);
   auto it = tensor_name_to_bit_.find(response.tensor_names()[0]);
   if (it != tensor_name_to_bit_.end()) {
     // If entry associated with this response already exists in cache, check
     // if tensor parameters match. If not, return that entry is invalid.
     uint32_t cache_bit = it->second;
+    auto& cache_response = std::get<0>(*cache_iters_[cache_bit]);
     auto& cache_params = std::get<1>(*cache_iters_[cache_bit]);
+
+    bool same_shape;
+    if (joined) {
+      // For Joined rank only number of elements in the tensor is known.
+      auto product = [](const std::vector<int64_t>& shape) {
+        return std::accumulate(shape.begin(), shape.end(), 1,
+                               std::multiplies<int64_t>());
+      };
+      same_shape = (product(cache_params.shape) == product(params.shape));
+    } else {
+      same_shape = (cache_params.shape == params.shape);
+    }
+
     return (cache_params.device == params.device &&
-            cache_params.dtype == params.dtype &&
-            cache_params.shape == params.shape)
+            cache_params.dtype == params.dtype && same_shape &&
+            cache_response.prescale_factor() == response.prescale_factor() &&
+            cache_response.postscale_factor() == response.postscale_factor())
                ? CacheState::HIT
                : CacheState::INVALID;
   } else {
@@ -81,11 +102,11 @@ ResponseCache::cached(const Response& response,
   }
 }
 
-void ResponseCache::put_(const Response& response, TensorParams& params) {
+void ResponseCache::put_(const Response& response, TensorParams& params, bool joined) {
   // Note: This method invalidates all previously returned cache bit positions.
 
   uint32_t cache_bit;
-  auto cache_state = this->cached(response, params);
+  auto cache_state = this->cached(response, params, joined);
 
   // Disallow caching name-conflicted responses here. Invalid cache entries
   // must be removed prior to caching new entries.
@@ -95,7 +116,7 @@ void ResponseCache::put_(const Response& response, TensorParams& params) {
         "This is not allowed.");
   }
 
-  if (this->cached(response, params) == CacheState::HIT) {
+  if (cache_state == CacheState::HIT) {
     // If entry already exists, move entry to front of cache_
     // (most recently used) and update iterator in cache_iters_
     // at the existing cache bit position.
@@ -106,10 +127,11 @@ void ResponseCache::put_(const Response& response, TensorParams& params) {
   } else if (cache_.size() == capacity_) {
     if (print_warning_) {
       std::stringstream message;
-      message << "A response has been evicted from cache which may indicate reduced "
-                 "performance. Better performance may be obtained by disabling caching "
-                 "(HOROVOD_CACHE_CAPACITY=0) or increasing the cache capacity "
-                 "(HOROVOD_CACHE_CAPACITY>" <<std::to_string(capacity_) << ").";
+      message << "A response has been evicted from cache which may indicate "
+                 "reduced performance. Better performance may be obtained by "
+                 "disabling caching (HOROVOD_CACHE_CAPACITY=0) or increasing "
+                 "the cache capacity (HOROVOD_CACHE_CAPACITY>"
+              << std::to_string(capacity_) << ").";
       LOG(WARNING) << message.str();
       print_warning_ = false;
     }
@@ -133,44 +155,56 @@ void ResponseCache::put_(const Response& response, TensorParams& params) {
   cache_iters_[cache_bit] = cache_.begin();
   tensor_name_to_bit_[response.tensor_names()[0]] = cache_bit;
 
-  // Cache is mutated, mark that bit assignments are stale.
-  bits_outdated_ = true;
 }
 
-void ResponseCache::put(const Response& response, const TensorTable& tensor_table) {
-  // Note: This method invalidates all previously returned cache bit positions if
-  // evictions occur.
+void ResponseCache::put(const Response& response, TensorQueue& tensor_queue, bool joined) {
+  // Note: This method invalidates all previously returned cache bit positions
+  // if evictions occur.
 
   if (capacity_ == 0) {
     return;
   }
 
+  std::vector<TensorTableEntry> entries_for_join;
+  if (joined) {
+    tensor_queue.GetTensorEntriesFromResponse(response, entries_for_join,
+                                              joined);
+  }
+
   // If response is fused, split back into individual responses
   if (response.tensor_names().size() > 1) {
+    int64_t i = 0;
     for (auto& name : response.tensor_names()) {
       Response new_response;
       new_response.add_tensor_name(name);
       new_response.set_response_type(response.response_type());
       new_response.set_devices(response.devices());
-      new_response.set_tensor_sizes(response.tensor_sizes());
+      new_response.add_tensor_size(response.tensor_sizes()[i]);
+      new_response.set_tensor_type(response.tensor_type());
+      new_response.set_prescale_factor(response.prescale_factor());
+      new_response.set_postscale_factor(response.postscale_factor());
 
-      // Populate tensor parameters from tensor_table entry
-      auto& tensor_entry = tensor_table.at(name);
+      // Populate tensor parameters from tensor_queue entry
       TensorParams params;
+      const auto& tensor_entry =
+          joined ? entries_for_join[i] : tensor_queue.GetTensorEntry(name);
       params.device = tensor_entry.device;
       params.dtype = tensor_entry.tensor->dtype();
       params.shape = tensor_entry.tensor->shape().to_vector();
 
-      this->put_(new_response, params);
+      this->put_(new_response, params, joined);
+      i++;
     }
   } else {
-    auto& tensor_entry = tensor_table.at(response.tensor_names()[0]);
     TensorParams params;
+    const auto& tensor_entry =
+        joined ? entries_for_join[0]
+               : tensor_queue.GetTensorEntry(response.tensor_names()[0]);
     params.device = tensor_entry.device;
     params.dtype = tensor_entry.tensor->dtype();
     params.shape = tensor_entry.tensor->shape().to_vector();
 
-    this->put_(response, params);
+    this->put_(response, params, joined);
   }
 }
 
@@ -184,9 +218,6 @@ const Response& ResponseCache::get_response(uint32_t cache_bit) {
   cache_.push_front(std::move(*it));
   cache_.erase(it);
   cache_iters_[cache_bit] = cache_.begin();
-
-  // Cache is mutated, mark that bit assignments are stale.
-  bits_outdated_ = true;
 
   return cache_.front().first;
 }
@@ -205,6 +236,14 @@ uint32_t ResponseCache::peek_cache_bit(const std::string& tensor_name) const {
   return tensor_name_to_bit_.at(tensor_name);
 }
 
+std::vector<uint32_t> ResponseCache::list_all_bits() const {
+  std::vector<uint32_t> result;
+  for (auto& it : tensor_name_to_bit_) {
+    result.push_back(it.second);
+  }
+  return result;
+}
+
 void ResponseCache::erase_response(uint32_t cache_bit) {
   assert(cache_bit < cache_iters_.size());
 
@@ -220,14 +259,14 @@ void ResponseCache::erase_response(uint32_t cache_bit) {
 
   cache_iters_[cache_bit] = cache_.end();
 
-  // Cache is mutated, mark that bit assignments are stale.
+  // Set flag to trigger update_cache_bits to remove empty
+  // positions in cache_iters_ vector
   bits_outdated_ = true;
 }
 
 void ResponseCache::update_cache_bits() {
   // Note: This method invalidates all previously returned cache bit positions.
 
-  // If bit assignments are not stale, do nothing.
   if (!bits_outdated_) {
     return;
   }
@@ -265,6 +304,11 @@ void CacheCoordinator::record_invalid_bit(uint32_t bit) {
   invalid_in_queue_ = true;
 }
 
+void CacheCoordinator::erase_hit(uint32_t bit) {
+  assert(!synced_);
+  cache_hits_.erase(bit);
+}
+
 void CacheCoordinator::set_should_shut_down(bool should_shut_down) {
   assert(!synced_);
   should_shut_down_ = should_shut_down;
@@ -300,7 +344,8 @@ bool CacheCoordinator::uncached_in_queue() const {
   return uncached_in_queue_;
 }
 
-void CacheCoordinator::sync(MPIContext& ctx, bool timeline_enabled) {
+void CacheCoordinator::sync(std::shared_ptr<Controller> controller,
+                            bool timeline_enabled) {
   assert(!synced_);
 
   // Resize and initialize bit vector.
@@ -349,9 +394,8 @@ void CacheCoordinator::sync(MPIContext& ctx, bool timeline_enabled) {
     }
   }
 
-  // Global MPI AND operation to get intersected bit array.
-  MPI_Allreduce(MPI_IN_PLACE, bitvector_.data(), fullcount,
-                MPI_LONG_LONG_INT, MPI_BAND, ctx.mpi_comm);
+  // Global AND operation to get intersected bit array.
+  controller->CrossRankBitwiseAnd(bitvector_, fullcount);
 
   // Search for flipped bits to populate common cache hit set. There will never
   // be invalid bits in this set.
@@ -379,19 +423,16 @@ void CacheCoordinator::sync(MPIContext& ctx, bool timeline_enabled) {
   }
 
   // If any worker has invalid cache entries, communicate invalid bits across
-  // workers using a second MPI allreduce operation.
+  // workers using a second bit-wise allreduce operation.
   if (invalid_in_queue_) {
     std::memset(&bitvector_[0], 0, count * sizeof(long long));
     for (auto bit : invalid_bits_) {
       int shift = bit / (sizeof(long long) * CHAR_BIT);
-      bitvector_[shift] |=
-          (1ull << (bit % (sizeof(long long) * CHAR_BIT)));
+      bitvector_[shift] |= (1ull << (bit % (sizeof(long long) * CHAR_BIT)));
     }
 
-    // Global MPI OR operation to get common invalid bits.
-    MPI_Allreduce(MPI_IN_PLACE, bitvector_.data(), count,
-                  MPI_LONG_LONG_INT, MPI_BOR, ctx.mpi_comm);
-
+    // Global OR operation to get common invalid bits.
+    controller->CrossRankBitwiseOr(bitvector_, count);
     // Search for flipped bits to populate common invalid bit set.
     invalid_bits_.clear();
     for (int i = 0; i < count; ++i) {

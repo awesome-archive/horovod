@@ -25,12 +25,14 @@
 
 #include "common.h"
 #include "message.h"
-#include "mpi_context.h"
 
 #define NUM_STATUS_BITS 3
 
 namespace horovod {
 namespace common {
+
+class Controller;
+class TensorQueue;
 
 // Structure to store relevant tensor parameters to deal with name collisions
 struct TensorParams {
@@ -42,6 +44,9 @@ struct TensorParams {
 // LRU cache of Responses
 class ResponseCache {
 public:
+  ResponseCache() = default;
+  ResponseCache(const ResponseCache&) = delete;
+
   enum CacheState { MISS = 0, HIT = 1, INVALID = 2 };
 
   void clear();
@@ -54,9 +59,11 @@ public:
 
   CacheState cached(const Request& message) const;
 
-  CacheState cached(const Response& response, const TensorParams& params) const;
+  CacheState cached(const Response& response, const TensorParams& params,
+                    bool joined = false) const;
 
-  void put(const Response& response, const TensorTable& tensor_table);
+  void put(const Response& response, TensorQueue& tensor_queue,
+           bool joined = false);
 
   const Response& get_response(uint32_t cache_bit);
 
@@ -66,12 +73,15 @@ public:
 
   uint32_t peek_cache_bit(const std::string& tensor_name) const;
 
+  std::vector<uint32_t> list_all_bits() const;
+
   void erase_response(uint32_t cache_bit);
 
   void update_cache_bits();
 
 private:
-  void put_(const Response& response, TensorParams& params);
+  void put_(const Response& response, TensorParams& params,
+            bool joined = false);
 
   uint32_t capacity_ = 0;
 
@@ -92,7 +102,7 @@ private:
 };
 
 // Helper class to coordinate cache and state information
-// across workers. Uses global MPI operations on a bit vector
+// across workers. Uses global controller operations on a bit vector
 // for cheaper coordination.
 class CacheCoordinator {
 public:
@@ -101,6 +111,8 @@ public:
   void record_hit(uint32_t bit);
 
   void record_invalid_bit(uint32_t bit);
+
+  void erase_hit(uint32_t bit);
 
   void set_should_shut_down(bool should_shut_down);
 
@@ -116,9 +128,8 @@ public:
 
   bool uncached_in_queue() const;
 
-  // Method to sync state and bit sets across workers
-  // with MPI.
-  void sync(MPIContext& ctx, bool timeline_enabled);
+  // Method to sync state and bit sets across workers.
+  void sync(std::shared_ptr<Controller> controller, bool timeline_enabled);
 
 private:
   enum StatusBit {

@@ -3,7 +3,7 @@
 	url = https://github.com/yixuan/LBFGSpp.git
 [submodule "third_party/eigen"]
 	path = third_party/eigen
-	url = https://github.com/eigenteam/eigen-git-mirror.git
+	url = https://gitlab.com/libeigen/eigen.git
 [submodule "third_party/boost/assert"]
 	path = third_party/boost/assert
 	url = https://github.com/boostorg/assert.git
@@ -49,3 +49,6 @@
 [submodule "third_party/gloo"]
 	path = third_party/gloo
 	url = https://github.com/facebookincubator/gloo.git
+[submodule "third_party/HTTPRequest"]
+	path = third_party/HTTPRequest
+	url = https://github.com/elnormous/HTTPRequest

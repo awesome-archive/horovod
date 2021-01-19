@@ -1,5 +1,5 @@
 # Copyright (C) 2019 Uber Technologies, Inc.
-#
+# Modifications copyright Microsoft
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
 # You may obtain a copy of the License at
@@ -16,7 +16,7 @@
 import atexit
 import ctypes
 
-import horovod.common.util as util
+from horovod.common import util as util
 
 
 class HorovodBasics(object):
@@ -25,6 +25,10 @@ class HorovodBasics(object):
     def __init__(self, pkg_path, *args):
         full_path = util.get_extension_full_path(pkg_path, *args)
         self.MPI_LIB_CTYPES = ctypes.CDLL(full_path, mode=ctypes.RTLD_GLOBAL)
+
+        self.Average = self.MPI_LIB_CTYPES.horovod_reduce_op_average()
+        self.Sum = self.MPI_LIB_CTYPES.horovod_reduce_op_sum()
+        self.Adasum = self.MPI_LIB_CTYPES.horovod_reduce_op_adasum()
 
     def init(self, comm=None):
         """A function that initializes Horovod.
@@ -40,6 +44,12 @@ class HorovodBasics(object):
         atexit.register(self.shutdown)
 
         if not isinstance(comm, list):
+            mpi_built = self.MPI_LIB_CTYPES.horovod_mpi_built()
+            if not bool(mpi_built):
+                raise ValueError(
+                    "Horovod has not been built with MPI support. Ensure MPI is installed and "
+                    "reinstall Horovod with HOROVOD_WITH_MPI=1 to debug the build error.")
+
             from mpi4py import MPI
             if MPI._sizeof(MPI.Comm) == ctypes.sizeof(ctypes.c_int):
                 MPI_Comm = ctypes.c_int
@@ -48,15 +58,44 @@ class HorovodBasics(object):
                 self.MPI_LIB_CTYPES.horovod_init_comm.argtypes = [MPI_Comm]
 
             comm_obj = MPI_Comm.from_address(MPI._addressof(comm))
-            return self.MPI_LIB_CTYPES.horovod_init_comm(comm_obj)
+            self.MPI_LIB_CTYPES.horovod_init_comm(comm_obj)
         else:
             comm_size = len(comm)
-            return self.MPI_LIB_CTYPES.horovod_init(
+            self.MPI_LIB_CTYPES.horovod_init(
                 (ctypes.c_int * comm_size)(*comm), ctypes.c_int(comm_size))
 
     def shutdown(self):
         """A function that shuts Horovod down."""
-        return self.MPI_LIB_CTYPES.horovod_shutdown()
+        self.MPI_LIB_CTYPES.horovod_shutdown()
+
+    def is_initialized(self):
+        """Returns True if Horovod is initialized"""
+        return self.MPI_LIB_CTYPES.horovod_is_initialized()
+
+    def start_timeline(self, file_path, mark_cycles=False):
+        """Creates a timeline file at `file_path` and begins recording.
+
+        Args:
+            file_path: String path to the timeline file.
+            mark_cycles: Boolean indicating that cycles should be marked on
+                         the timeline (default: False).
+
+        Raises a `ValueError` if Horovod is not initialized.
+        """
+        result = self.MPI_LIB_CTYPES.horovod_start_timeline(
+            ctypes.c_char_p(file_path.encode('utf-8')),
+            ctypes.c_bool(mark_cycles))
+        if not result:
+            raise ValueError('Horovod has not been initialized; use hvd.init().')
+
+    def stop_timeline(self):
+        """Stops the active timeline recording and closes the file.
+
+        Raises a `ValueError` if Horovod is not initialized.
+        """
+        result = self.MPI_LIB_CTYPES.horovod_stop_timeline()
+        if not result:
+            raise ValueError('Horovod has not been initialized; use hvd.init().')
 
     def size(self):
         """A function that returns the number of Horovod processes.
@@ -109,6 +148,15 @@ class HorovodBasics(object):
                 'Horovod has not been initialized; use hvd.init().')
         return local_rank
 
+    def is_homogeneous(self):
+        """Returns True if the cluster is homogeneous.
+
+        Returns:
+          A boolean value indicating whether every node in the cluster has same number of ranks.
+        """
+        is_homogeneous = self.MPI_LIB_CTYPES.horovod_is_homogeneous()
+        return bool(is_homogeneous)
+
     def mpi_threads_supported(self):
         """A function that returns a flag indicating whether MPI multi-threading is supported.
 
@@ -118,8 +166,93 @@ class HorovodBasics(object):
         Returns:
           A boolean value indicating whether MPI multi-threading is supported.
         """
+        mpi_enabled = self.MPI_LIB_CTYPES.horovod_mpi_enabled()
+        if not bool(mpi_enabled):
+            raise ValueError(
+                'Horovod MPI is not enabled; Please make sure it\'s installed and enabled.')
+
         mpi_threads_supported = self.MPI_LIB_CTYPES.horovod_mpi_threads_supported()
         if mpi_threads_supported == -1:
             raise ValueError(
                 'Horovod has not been initialized; use hvd.init().')
         return bool(mpi_threads_supported)
+
+    def mpi_enabled(self):
+        """Returns True if MPI is mode is currently enabled at runtime.
+
+        If MPI is enabled, users can use it for controller or data transfer operations.
+
+        Returns:
+          A boolean value indicating whether MPI is enabled.
+        """
+        mpi_enabled = self.MPI_LIB_CTYPES.horovod_mpi_enabled()
+        return bool(mpi_enabled)
+
+    def mpi_built(self):
+        """Returns True if Horovod was compiled with MPI support.
+
+        Returns:
+          A boolean value indicating whether MPI support was compiled.
+        """
+        return bool(self.MPI_LIB_CTYPES.horovod_mpi_built())
+
+    def gloo_enabled(self):
+        """Returns True if Gloo is mode is currently enabled at runtime.
+
+        If Gloo is enabled, users can use it for controller or data transfer operations.
+
+        Returns:
+          A boolean value indicating whether Gloo is enabled.
+        """
+        gloo_enabled = self.MPI_LIB_CTYPES.horovod_gloo_enabled()
+        return bool(gloo_enabled)
+
+    def gloo_built(self):
+        """Returns True if Horovod was compiled with Gloo support.
+
+        Returns:
+          A boolean value indicating whether Gloo support was compiled.
+        """
+        return bool(self.MPI_LIB_CTYPES.horovod_gloo_built())
+
+    def nccl_built(self):
+        """Function to check if Horovod was compiled with NCCL support.
+
+        Returns:
+          An integer value indicating whether NCCL support was compiled.
+          If NCCL support was compiled, returns NCCL_VERSION_CODE. Otherwise,
+          returns 0.
+        """
+        return int(self.MPI_LIB_CTYPES.horovod_nccl_built())
+
+    def ddl_built(self):
+        """Returns True if Horovod was compiled with DDL support.
+
+        Returns:
+          A boolean value indicating whether DDL support was compiled.
+        """
+        return bool(self.MPI_LIB_CTYPES.horovod_ddl_built())
+
+    def ccl_built(self):
+        """Returns True if Horovod was compiled with oneCCL support.
+
+        Returns:
+          A boolean value indicating whether oneCCL support was compiled.
+        """
+        return bool(self.MPI_LIB_CTYPES.horovod_ccl_built())
+
+    def cuda_built(self):
+        """Returns True if Horovod was compiled with CUDA support.
+
+        Returns:
+          A boolean value indicating whether CUDA support was compiled.
+        """
+        return bool(self.MPI_LIB_CTYPES.horovod_cuda_built())
+
+    def rocm_built(self):
+        """Returns True if Horovod was compiled with ROCm support.
+
+        Returns:
+          A boolean value indicating whether ROCm support was compiled.
+        """
+        return bool(self.MPI_LIB_CTYPES.horovod_rocm_built())

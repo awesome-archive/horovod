@@ -1,4 +1,5 @@
-git+https://github.com/sphinx-doc/sphinx@2.0
+sphinx
 sphinxcontrib-napoleon
 alabaster
 nbsphinx
+pyyaml

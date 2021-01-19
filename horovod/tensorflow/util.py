@@ -1,4 +1,4 @@
-# Copyright 2018 Uber Technologies, Inc. All Rights Reserved.
+# Copyright 2019 Uber Technologies, Inc. All Rights Reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -12,18 +12,33 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ==============================================================================
-from distutils.version import LooseVersion
 
 import tensorflow as tf
 
 
-if LooseVersion(tf.__version__) >= LooseVersion("1.9.0"):
-    from tensorflow.python.eager import context
-    _has_eager = True
-else:
-    _has_eager = False
+from tensorflow.python.eager import context
 
 
 def _executing_eagerly():
     """Returns true if eager execution is supported and enabled."""
-    return _has_eager and context.in_eager_mode()
+    return context.executing_eagerly()
+
+
+def _make_subgraph(f):
+    return tf.function(f)
+
+
+def _cache(f):
+    cache = dict()
+
+    def wrapper(*args):
+        key = (args, _executing_eagerly())
+
+        if key in cache:
+            return cache[key]
+        else:
+            retval = f(*args)
+            cache[key] = retval
+            return retval
+
+    return wrapper

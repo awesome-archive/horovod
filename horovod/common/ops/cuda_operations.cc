@@ -14,173 +14,154 @@
 // limitations under the License.
 // =============================================================================
 
-#include "cuda_operations.h"
+#include "gpu_operations.h"
+#include "cuda/cuda_kernels.h"
+#include "../message.h"
 
 #include <thread>
 
 namespace horovod {
 namespace common {
 
-cudaError_t CUDAContext::GetCudaEvent(cudaEvent_t* event) {
-  int device;
-  auto status = cudaGetDevice(&device);
-  if (status != cudaSuccess) {
-    return status;
+class GPUContext::impl {
+public:
+  cudaError_t GetGpuEvent(cudaEvent_t* event) {
+    int device;
+    auto status = cudaGetDevice(&device);
+    if (status != cudaSuccess) {
+      return status;
+    }
+
+    auto& mutex = cuda_events_mutex;
+    {
+      std::lock_guard<std::mutex> guard(mutex);
+      auto& queue = cuda_events[device];
+      if (!queue.empty()) {
+        *event = queue.front();
+        queue.pop();
+        return cudaSuccess;
+      }
+    }
+
+    return cudaEventCreateWithFlags(event, cudaEventDisableTiming);
   }
 
-  auto& mutex = cuda_events_mutex;
-  {
-    std::lock_guard<std::mutex> guard(mutex);
-    auto& queue = cuda_events[device];
-    if (!queue.empty()) {
-      *event = queue.front();
-      queue.pop();
-      return cudaSuccess;
+  cudaError_t ReleaseGpuEvent(cudaEvent_t event) {
+    int device;
+    auto status = cudaGetDevice(&device);
+    if (status != cudaSuccess) {
+      return status;
+    }
+
+    auto& mutex = cuda_events_mutex;
+    {
+      std::lock_guard<std::mutex> guard(mutex);
+      auto& queue = cuda_events[device];
+      queue.push(event);
+    }
+
+    return cudaSuccess;
+  }
+
+  void ErrorCheck(std::string op_name, cudaError_t cuda_result) {
+    if (cuda_result != cudaSuccess) {
+      throw std::logic_error(std::string(op_name) + " failed: " + cudaGetErrorString(cuda_result));
     }
   }
 
-  return cudaEventCreateWithFlags(event, cudaEventBlockingSync |
-                                         cudaEventDisableTiming);
-}
-
-cudaError_t CUDAContext::ReleaseCudaEvent(cudaEvent_t event) {
-  int device;
-  auto status = cudaGetDevice(&device);
-  if (status != cudaSuccess) {
-    return status;
-  }
-
-  auto& mutex = cuda_events_mutex;
-  {
-    std::lock_guard<std::mutex> guard(mutex);
-    auto& queue = cuda_events[device];
-    queue.push(event);
-  }
-
-  return cudaSuccess;
-}
-
-void CUDAContext::ErrorCheck(std::string op_name, cudaError_t cuda_result) {
-  if (cuda_result != cudaSuccess) {
-    throw std::logic_error(std::string(op_name) + " failed: " + cudaGetErrorString(cuda_result));
-  }
-}
-
-void CUDAContext::RecordEvent(std::queue<std::pair<std::string, cudaEvent_t>>& event_queue,
-                              std::string name, cudaStream_t& stream) {
-  cudaEvent_t event;
-  ErrorCheck("GetCudaEvent", GetCudaEvent(&event));
-  ErrorCheck("cudaEventRecord", cudaEventRecord(event, stream));
-  event_queue.emplace(name, event);
-}
-
-void CUDAContext::WaitForEvents(std::queue<std::pair<std::string, cudaEvent_t>>& event_queue,
-                                const std::vector<TensorTableEntry>& entries, Timeline& timeline) {
-  while (!event_queue.empty()) {
-    std::string name;
+  void RecordEvent(std::queue<std::pair<std::string, cudaEvent_t>>& event_queue, std::string name, cudaStream_t& stream) {
     cudaEvent_t event;
-    std::tie(name, event) = event_queue.front();
-    event_queue.pop();
-    if (name != "") {
-      timeline.ActivityStartAll(entries, name);
-    }
-    ErrorCheck("cudaEventSynchronize", cudaEventSynchronize(event));
-    if (name != "") {
-      timeline.ActivityEndAll(entries);
-    }
-    ErrorCheck("ReleaseCudaEvent", ReleaseCudaEvent(event));
+    ErrorCheck("GetGpuEvent", GetGpuEvent(&event));
+    ErrorCheck("cudaEventRecord", cudaEventRecord(event, stream));
+    event_queue.emplace(name, event);
   }
-}
 
-CUDAAllreduce::CUDAAllreduce(CUDAContext* context,
-                             HorovodGlobalState* global_state)
-    : AllreduceOp(global_state), cuda_context_(context) {}
+  void WaitForEvents(std::queue<std::pair<std::string, cudaEvent_t>>& event_queue,
+      const std::vector<TensorTableEntry>& entries, Timeline& timeline,
+      const std::function<void()>& error_check_callback) {
+    while (!event_queue.empty()) {
+      std::string name;
+      cudaEvent_t event;
+      std::tie(name, event) = event_queue.front();
+      event_queue.pop();
+      if (name != "") {
+        timeline.ActivityStartAll(entries, name);
+      }
 
-bool CUDAAllreduce::Enabled(const ParameterManager& param_manager,
-                            const std::vector<TensorTableEntry>& entries,
-                            const Response& response) const {
-  return entries[0].device != CPU_DEVICE_ID;
-}
+      // Check for async (networking) errors while waiting for the event to complete
+      cudaError_t cuda_result;
+      while (true) {
+        cuda_result = cudaEventQuery(event);
+        if (cuda_result == cudaSuccess) {
+          break;
+        }
 
-void CUDAAllreduce::MemcpyEntryInFusionBuffer(const std::vector<TensorTableEntry>& entries,
-                                              const TensorTableEntry& e, void* buffer_data_at_offset) {
-  auto& first_entry = entries[0];
-  auto cuda_result = cudaMemcpyAsync(buffer_data_at_offset, e.tensor->data(),
-                                     (size_t) e.tensor->size(), cudaMemcpyDeviceToDevice,
-                                     cuda_context_->streams[global_state_->current_nccl_stream][first_entry.device]);
-  cuda_context_->ErrorCheck("cudaMemcpyAsync", cuda_result);
-}
+        if (cuda_result != cudaErrorNotReady) {
+          throw std::logic_error(std::string("cudaEventQuery failed: ") + cudaGetErrorString(cuda_result));
+        }
 
-void CUDAAllreduce::MemcpyEntryOutFusionBuffer(const std::vector<TensorTableEntry>& entries,
-                                               const void* buffer_data_at_offset, TensorTableEntry& e) {
-  auto& first_entry = entries[0];
-  auto cuda_result = cudaMemcpyAsync((void*) e.output->data(), buffer_data_at_offset,
-                                     (size_t) e.tensor->size(), cudaMemcpyDeviceToDevice,
-                                     cuda_context_->streams[global_state_->current_nccl_stream][first_entry.device]);
-  cuda_context_->ErrorCheck("cudaMemcpyAsync", cuda_result);
-}
+        if (error_check_callback) {
+          error_check_callback();
+        }
+        std::this_thread::yield();
+      }
 
-void CUDAAllreduce::InitCUDA(const std::vector<TensorTableEntry>& entries) {
-  auto& first_entry = entries[0];
-  cuda_context_->ErrorCheck("cudaSetDevice", cudaSetDevice(first_entry.device));
+      if (name != "") {
+        timeline.ActivityEndAll(entries);
+      }
+      ErrorCheck("ReleaseGpuEvent", ReleaseGpuEvent(event));
+    }
+  }
 
-  // Ensure stream is in the map before executing reduction.
-  cudaStream_t& stream = cuda_context_->streams[global_state_->current_nccl_stream][first_entry.device];
-  if (stream == nullptr) {
+  void StreamCreate(cudaStream_t *stream) {
     int greatest_priority;
-    cuda_context_->ErrorCheck("cudaDeviceGetStreamPriorityRange",
-                              cudaDeviceGetStreamPriorityRange(NULL, &greatest_priority));
-    cuda_context_->ErrorCheck("cudaStreamCreateWithPriority",
-                              cudaStreamCreateWithPriority(&stream, cudaStreamNonBlocking, greatest_priority));
+    ErrorCheck("cudaDeviceGetStreamPriorityRange",
+        cudaDeviceGetStreamPriorityRange(NULL, &greatest_priority));
+    ErrorCheck("cudaStreamCreateWithPriority",
+        cudaStreamCreateWithPriority(stream, cudaStreamNonBlocking, greatest_priority));
   }
-}
 
-void CUDAAllreduce::InitCUDAQueue(const std::vector<TensorTableEntry>& entries, const Response& response) {
-  event_queue_ = std::queue<std::pair<std::string, cudaEvent_t>>();
-  stream_ = &cuda_context_->streams[global_state_->current_nccl_stream][entries[0].device];
-  host_buffer_ = nullptr;
-
-  if (global_state_->timeline.Initialized()) {
-    cuda_context_->RecordEvent(event_queue_, QUEUE, *stream_);
+  void StreamSynchronize(cudaStream_t stream) {
+    ErrorCheck("cudaStreamSynchronize", cudaStreamSynchronize(stream));
   }
-}
 
-Status CUDAAllreduce::FinalizeCUDAQueue(const std::vector<TensorTableEntry>& entries) {
-  // Use completion marker via event because it's faster than
-  // blocking cudaStreamSynchronize() in this thread.
-  cuda_context_->RecordEvent(event_queue_, "", *stream_);
+  int GetDevice() {
+    int device;
+    ErrorCheck("cudaGetDevice", cudaGetDevice(&device));
+    return device;
+  }
 
-  auto& first_entry = entries[0];
-  void* host_buffer = host_buffer_;
-  auto& event_queue = event_queue_;
-  auto& timeline = global_state_->timeline;
-  auto& cuda_context = cuda_context_;
+  void SetDevice(int device) {
+    ErrorCheck("cudaSetDevice", cudaSetDevice(device));
+  }
 
-  // TODO: use thread pool or single thread for callbacks
-  std::thread finalizer_thread([entries, first_entry, host_buffer,
-                                event_queue, &timeline, &cuda_context]() mutable {
-    auto cuda_result = cudaSetDevice(first_entry.device);
-    cuda_context->ErrorCheck("cudaSetDevice", cuda_result);
+  void MemcpyAsyncD2D(void* dst, const void* src, size_t count, cudaStream_t stream) {
+    ErrorCheck("cudaMemcpyAsync", cudaMemcpyAsync(dst, src, count, cudaMemcpyDeviceToDevice, stream));
+  }
 
-    cuda_context->WaitForEvents(event_queue, entries, timeline);
-    if (host_buffer != nullptr) {
-      free(host_buffer);
-    }
+  void MemcpyAsyncH2D(void* dst, const void* src, size_t count, cudaStream_t stream) {
+    ErrorCheck("cudaMemcpyAsync", cudaMemcpyAsync(dst, src, count, cudaMemcpyHostToDevice, stream));
+  }
 
-    for (auto& e : entries) {
-      timeline.End(e.tensor_name, e.output);
-      e.callback(Status::OK());
-    }
-  });
+  void MemcpyAsyncD2H(void* dst, const void* src, size_t count, cudaStream_t stream) {
+    ErrorCheck("cudaMemcpyAsync", cudaMemcpyAsync(dst, src, count, cudaMemcpyDeviceToHost, stream));
+  }
 
-  finalizer_thread.detach();
+  void ScaleBufferImpl(const void* fused_input_data, void* buffer_data, int64_t num_elements,
+                       double scale_factor, DataType dtype, cudaStream_t stream) {
+    ScaleBufferCudaImpl(fused_input_data, buffer_data, num_elements, scale_factor, dtype, stream);
 
-  // Update current stream
-  global_state_->current_nccl_stream = (global_state_->current_nccl_stream + 1) %
-                                  global_state_->num_nccl_streams;
+    // TODO: https://github.com/horovod/horovod/issues/2230
+    //ErrorCheck("ScaleBufferCudaImpl", cudaGetLastError());
+  }
 
-  return Status::InProgress();
-}
+private:
+  // We reuse CUDA events as it appears that their creation carries non-zero cost.
+  std::unordered_map<int, std::queue<cudaEvent_t>> cuda_events;
+  std::mutex cuda_events_mutex;
+};
+
+#include "gpu_context_impl.cc"
 
 } // namespace common
 } // namespace horovod

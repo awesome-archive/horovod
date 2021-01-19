@@ -1,5 +1,6 @@
 // Copyright 2016 The TensorFlow Authors. All Rights Reserved.
 // Modifications copyright (C) 2017 Uber Technologies, Inc.
+// Modifications copyright Microsoft
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -36,7 +37,8 @@ enum DataType:byte {
 enum RequestType:byte {
     ALLREDUCE = 0,
     ALLGATHER = 1,
-    BROADCAST = 2
+    BROADCAST = 2,
+    JOIN = 3
 }
 table Request {
     // The request rank is necessary to create a consistent ordering of results,
@@ -56,6 +58,11 @@ table Request {
     // We use a repeated integer instead of a TensorShapeProto because linking directly
     // to TensorFlow protos causes issues. See the comment for DataType.
     tensor_shape:[long];
+
+    // Prescale and postscale factors
+    prescale_factor:double;
+    postscale_factor:double;
+
 }
 table RequestList {
     requests:[Request];
@@ -73,7 +80,9 @@ enum ResponseType:byte {
     ALLREDUCE = 0,
     ALLGATHER = 1,
     BROADCAST = 2,
-    ERROR = 3
+    JOIN = 3,
+    ADASUM = 4,
+    ERROR = 5
 }
 table Response {
     response_type:ResponseType;
@@ -88,10 +97,19 @@ table Response {
     // List of devices participating in this operation.
     devices:[int];
 
-    // Empty unless response_type is ALLGATHER.
-    // These tensor sizes are the dimension zero sizes of all the input matrices,
-    // indexed by the rank.
+    // Empty unless response_type is ALLGATHER or there is at least one rank
+    // that requested Join and response_type is ALLREDUCE.
+    // For ALLGATHER, these tensor sizes are the dimension zero sizes
+    // of all the input matrices, indexed by the rank.
     tensor_sizes:[long];
+
+    // Empty unless response_type is ALLREDUCE and there is at least one rank
+    // that requested Join.
+    tensor_type:DataType;
+
+    // Prescale and postscale factors
+    prescale_factor:double;
+    postscale_factor:double;
 }
 table ResponseList {
     responses:[Response];

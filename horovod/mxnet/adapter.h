@@ -17,13 +17,14 @@
 #define HOROVOD_MXNET_ADAPTER_H
 
 #include <mxnet/base.h>
-
 #include "../common/common.h"
 
 namespace horovod {
 namespace mxnet {
 
 using namespace horovod::common;
+
+typedef ::mxnet::NDArray NDArray;
 
 class MXPersistentBuffer : public PersistentBuffer {
 public:
@@ -36,46 +37,36 @@ private:
   void* buffer_;
 };
 
-template <class T> class MXTensor : public Tensor {
+class MXTensor : public Tensor {
 public:
-  MXTensor(T* tensor);
+  MXTensor(NDArray *tensor);
   virtual const DataType dtype() const override;
   virtual const TensorShape shape() const override;
   virtual const void* data() const override;
   virtual int64_t size() const override;
 
 protected:
-  T* tensor_;
+  NDArray* tensor_;
 };
 
-template <class T> class MXTemporaryBuffer : public MXTensor<T> {
+class MXOpContext : public OpContext {
 public:
-  MXTemporaryBuffer(int device, int dtype);
-  MXTemporaryBuffer(T* tensor);
-  ~MXTemporaryBuffer();
-  virtual T* tensor() const;
-};
-
-template <class T> class MXOpContext : public OpContext {
-public:
-  MXOpContext(int device, T* output);
+  MXOpContext(int device, NDArray* output);
   virtual Status
   AllocatePersistent(int64_t size,
                      std::shared_ptr<PersistentBuffer>* tensor) override;
   virtual Status AllocateOutput(TensorShape shape,
                                 std::shared_ptr<Tensor>* tensor) override;
+  virtual Status AllocateZeros(int64_t num_elements, DataType dtype,
+                               std::shared_ptr<Tensor>* tensor) override;
   virtual Framework framework() const override;
 
 private:
   int device_;
-  T* output_;
+  NDArray* output_;
 };
 
-inline void ThrowIfError(const Status& status) {
-  if (!status.ok()) {
-    throw dmlc::Error(status.reason());
-  }
-}
+void ThrowIfError(const Status& status);
 
 } // namespace mxnet
 } // namespace horovod
